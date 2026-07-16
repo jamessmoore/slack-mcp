@@ -213,6 +213,13 @@ resource "aws_iam_policy" "deploy" {
         Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/${var.project_name}-deploy"
       },
       {
+        # GetUser is here (not just on the deploy_self_read inline policy
+        # below) because Terraform's state refresh reads back
+        # aws_iam_user.deploy regardless of which identity is running it --
+        # the CI role only holds this managed policy, not the deploy user's
+        # own inline policy, so without this the GitHub Actions apply 403s
+        # on iam:GetUser even though local applies (as the deploy user
+        # itself) work fine. Confirmed via a real CI run, 2026-07-16.
         Sid    = "SelfPolicyAttachment"
         Effect = "Allow"
         Action = [
@@ -223,6 +230,7 @@ resource "aws_iam_policy" "deploy" {
           "iam:GetUserPolicy",
           "iam:DeleteUserPolicy",
           "iam:ListUserPolicies",
+          "iam:GetUser",
         ]
         Resource = aws_iam_user.deploy.arn
       },
