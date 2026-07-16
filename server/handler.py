@@ -62,6 +62,11 @@ mcp = FastMCP(
     host="0.0.0.0",
     port=int(os.environ.get("PORT", "8000")),
     streamable_http_path="/mcp",
+    # Each Lambda invocation gets its own Mangum lifespan cycle (see
+    # lambda_handler below) -- there's no long-lived process to pin a
+    # session id to across requests, so every request must be fully
+    # self-contained.
+    stateless_http=True,
 )
 
 
@@ -107,5 +112,29 @@ def _post_file_to_slack(
         logger.error("post_file_to_slack failed: %s", exc)
         raise
 
-asgi_app = mcp.streamable_http_app()
-lambda_handler = Mangum(asgi_app, lifespan="off")
+def lambda_handler(event: dict, context: object) -> dict:
+    """Handle one Lambda invocation with a freshly built ASGI app.
+
+    Two things forced this out of module scope (both confirmed against a
+    real deployment on 2026-07-16, not theoretical):
+
+    1. FastMCP's streamable_http_app() wires a StreamableHTTPSessionManager
+       into the ASGI lifespan, and that manager's .run() task group only
+       starts if something sends lifespan startup/shutdown events --
+       Mangum's `lifespan="off"` (the original setting here) never sends
+       them, so every request 500'd with "Task group is not initialized."
+    2. Switching to `lifespan="auto"` fixed that, but Mangum enters a fresh
+       lifespan cycle on *every* invocation (see mangum/adapter.py), while
+       FastMCP caches one StreamableHTTPSessionManager instance on `mcp`
+       and that instance's .run() raises "can only be called once per
+       instance" if entered twice -- which a module-level singleton app
+       hits on the second warm invocation in the same container.
+
+    Resetting the cached session manager and rebuilding the ASGI app per
+    call keeps tool registration (a few cheap decorator calls, already
+    done at import time on `mcp`) while guaranteeing every session
+    manager instance is entered exactly once.
+    """
+    mcp._session_manager = None
+    asgi_app = mcp.streamable_http_app()
+    return Mangum(asgi_app, lifespan="auto")(event, context)
