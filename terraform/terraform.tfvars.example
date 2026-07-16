@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars (gitignored) for local applies, or supply as a
+# CI secret. Never commit real values.
+#
+# No Slack token variable here -- this stack reads the existing
+# daily-tech-brief-bedrock/slack-bot-token secret from Secrets Manager
+# (see secrets.tf). Override slack_secret_name only if that changes.
