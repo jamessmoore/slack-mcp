@@ -15,6 +15,7 @@ import os
 
 import boto3
 from mangum import Mangum
+from mangum.types import LambdaContext, LambdaEvent
 from mcp.server.fastmcp import FastMCP
 from slack_tools import SlackToolError, post_file_to_slack, post_to_slack
 from starlette.requests import Request
@@ -112,7 +113,7 @@ def _post_file_to_slack(
         logger.error("post_file_to_slack failed: %s", exc)
         raise
 
-def lambda_handler(event: dict, context: object) -> dict:
+def lambda_handler(event: LambdaEvent, context: LambdaContext) -> dict:
     """Handle one Lambda invocation with a freshly built ASGI app.
 
     Two things forced this out of module scope (both confirmed against a
