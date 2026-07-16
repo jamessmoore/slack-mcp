@@ -32,15 +32,24 @@ the vault's `PROJECTS/slack-mcp.md` 2026-07-15 scope decision).
 
 ## Current status — read before assuming anything is stale
 
-As of this writing: **scaffolded, not deployed.** Server code and Terraform
-exist and pass local verification (pytest, ruff, mypy, `terraform fmt`/
-`validate` with `-backend=false`). No GitHub repo has been created, no ECR
-image has been built or pushed, no `terraform apply` has run against real
-AWS, and the Terraform S3 state bucket (`slack-mcp-tfstate-<account-id>`)
-has not been bootstrapped. Don't assume any AWS resource in `terraform/`
-exists yet — check `aws bedrockagentcore-control list-gateways` /
-`aws lambda get-function --function-name slack-mcp` etc. to confirm current
-reality before making a claim about what's live.
+As of this writing: **live and deployed.** Real AWS resources exist and the
+full CI/CD path (feature branch → PR → passing `test` CI → merge to `main`
+→ auto-triggered `.github/workflows/deploy.yml` via GitHub OIDC →
+`terraform apply` → image build/push → `aws lambda update-function-code`)
+has been proven end-to-end more than once. Current shape:
+
+- Lambda: `slack-mcp` (container image, Python 3.13)
+- API Gateway HTTP API: `https://8gr00zm4d9.execute-api.us-west-2.amazonaws.com/`
+- AgentCore Gateway: `arn:aws:bedrock-agentcore:us-west-2:293528978619:gateway/slack-mcp-cp2plvgahi`,
+  target status `READY`
+- Deploy identities: local applies run as the `slack-mcp-deploy` IAM user,
+  CI runs as the `slack-mcp-github-deploy` OIDC role — see "Deploy identity
+  / RBAC" below.
+
+Don't assume this is stale, but also don't assume it's frozen — confirm
+current reality with `aws bedrockagentcore-control get-gateway-target` /
+`aws lambda get-function --function-name slack-mcp` etc. before making a
+claim about what's live, same as always.
 
 `daily-tech-brief-bedrock` has **not** been migrated onto this Gateway yet
 — it still uses its own vendored `app/slack_mcp_server/` and
@@ -49,16 +58,43 @@ this Gateway instead via `mcp-proxy-for-aws`'s `aws_iam_streamablehttp_client`,
 same client pattern as `CoreSample/agent/strands_agent.py`) is tracked as
 future work, not done.
 
-## Required workflow — once a GitHub repo exists
+## Required workflow
 
 Follow the same pattern as `CoreSample`/`daily-tech-brief-bedrock`: no
 direct commits or pushes to `main`, feature branch + PR + passing `test`
-CI check before merge. Treat any *manual* `terraform apply`, image push, or
-`aws lambda invoke` outside the normal PR flow as needing an explicit
-go-ahead in the current request — this is a new repo and a first-ever
-deploy would create real AWS resources (ECR repo, Lambda, API Gateway,
-AgentCore Gateway, Secrets Manager entry, IAM roles), not something to do
-opportunistically.
+CI check before merge. Merging to `main` auto-triggers `deploy.yml`, which
+applies Terraform and pushes a new Lambda image for real — treat any
+*manual* `terraform apply`, image push, or `aws lambda invoke` outside the
+normal PR flow as needing an explicit go-ahead in the current request, same
+as any other real-AWS-mutating action.
+
+## Deploy identity / RBAC
+
+Local applies and CI both run under a dedicated deploy identity scoped to
+exactly this stack's permissions — never the shared `flintstone` admin
+user. See `terraform/deploy_policy.tf` for the full policy and its header
+comment for the reasoning; the short version:
+
+- `aws_iam_policy.deploy` — one Terraform-managed managed policy, the
+  single source of truth for what either identity can do.
+- `aws_iam_user.deploy` (`slack-mcp-deploy`) — for local/manual applies,
+  policy attached by Terraform.
+- `slack-mcp-github-deploy` — GitHub OIDC role assumed by
+  `.github/workflows/deploy.yml`. The role and its trust policy are
+  **deliberately bootstrapped by hand, outside Terraform** — CI shouldn't
+  be able to widen its own trust boundary — but the policy *attachment* to
+  this same managed policy is Terraform-managed, so permissions can't drift
+  between the two identities. (They did once — `iam:GetUser` was briefly
+  only on the user's inline policy; see the `SelfPolicyAttachment`
+  statement's comment.)
+- The OIDC trust policy matches on `repository_id` (immutable numeric
+  GitHub repo ID) ANDed with a wildcard `sub` match, not a literal
+  `repo:org/repo:ref:...` string — GitHub now embeds immutable
+  account/repo IDs into `sub`, so a literal match breaks silently on the
+  platform's own schedule, not just on a repo rename.
+- This is the standard for bootstrapping *any* new project going forward,
+  not specific to slack-mcp: dedicated deploy user + scoped policy + OIDC
+  role sharing that same policy.
 
 ## Local verification before opening/updating a PR
 
@@ -97,10 +133,14 @@ terraform/
                         route with authorization_type = AWS_IAM
   agentcore_gateway.tf  AgentCore Gateway (AWS_IAM authorizer) + target
                         pointing at the API Gateway invoke URL
+  deploy_policy.tf      Dedicated deploy IAM user + managed policy, shared
+                        by CI's OIDC role -- see "Deploy identity / RBAC"
   versions.tf / variables.tf / outputs.tf / terraform.tfvars.example
 tests/                pytest: mocked Slack HTTP calls (slack_tools), tool
-                       registration + Mangum wiring smoke tests (handler)
-.github/workflows/test.yml   CI gate: ruff/mypy/pytest + terraform fmt/validate
+                       registration + Lambda-handler smoke tests (handler)
+.github/workflows/test.yml     CI gate: ruff/mypy/pytest + terraform fmt/validate
+.github/workflows/deploy.yml   Auto-triggered on push to main: terraform
+                                apply, image build/push, Lambda update
 ```
 
 ## Secrets
@@ -135,3 +175,15 @@ prefixes (`feat:`, `fix:`, etc.) — matches `CoreSample`/`daily-tech-brief-bedr
   (`terraform providers schema -json`) rather than guessing from docs —
   several `CoreSample` mistakes were caught this way and this repo's
   Terraform was written by copying that repo's already-verified shapes.
+- `server/handler.py`'s `lambda_handler` rebuilds the FastMCP ASGI app and
+  wraps it in a fresh `Mangum(..., lifespan="auto")` on *every* invocation —
+  don't "simplify" this back to a module-level `Mangum(asgi_app)` singleton.
+  It looks redundant but isn't: FastMCP's `streamable_http_app()` memoizes a
+  single `StreamableHTTPSessionManager` whose `.run()` can only be entered
+  once per instance, while Mangum enters a fresh lifespan cycle on every
+  call — a singleton wrapper works on cold start and then 500s on the very
+  next warm invocation in the same container with
+  `StreamableHTTPSessionManager .run() can only be called once per
+  instance`. Confirmed against a real deployment 2026-07-16; regression test
+  is `tests/test_handler.py::test_lambda_handler_builds_a_fresh_asgi_app_and_session_manager_each_call`,
+  which calls `lambda_handler` twice in a row specifically to catch this.
